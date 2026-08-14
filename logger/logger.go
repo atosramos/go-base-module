@@ -13,12 +13,14 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Logger wraps a zap.Logger and provides convenience methods for
 // tenant-scoped and auth-domain-specific structured logging.
 type Logger struct {
-	zl *zap.Logger
+	zl     *zap.Logger
+	syncer *S3Syncer
 }
 
 // New creates a new Logger. In production mode, outputs JSON. In development
@@ -47,19 +49,43 @@ func New(production bool) (*Logger, error) {
 		cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	}
 
-	zl, err := cfg.Build(
-		zap.AddCallerSkip(1),
-		zap.AddStacktrace(zapcore.ErrorLevel),
-	)
-	if err != nil {
-		return nil, err
+	// Optional local file rotation using lumberjack
+	logDir := os.Getenv("LOG_DIR")
+	if logDir == "" {
+		logDir = "/var/log/restag" // Default log dir
+	}
+	
+	// Create lumberjack logger for rotation
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   logDir + "/app.log",
+		MaxSize:    10, // megabytes
+		MaxBackups: 5,
+		MaxAge:     28, // days
+		Compress:   true, // disabled by default, but let's enable to save space
 	}
 
-	return &Logger{zl: zl}, nil
+	// Always write to stdout (for docker/wazuh) AND to the rotated file (for S3)
+	core := zapcore.NewTee(
+		zapcore.NewCore(zapcore.NewJSONEncoder(cfg.EncoderConfig), zapcore.AddSync(os.Stdout), cfg.Level),
+		zapcore.NewCore(zapcore.NewJSONEncoder(cfg.EncoderConfig), zapcore.AddSync(lumberjackLogger), cfg.Level),
+	)
+
+	zl := zap.New(core, zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
+
+	var syncer *S3Syncer
+	bucketName := os.Getenv("AWS_S3_LOG_BUCKET")
+	if bucketName != "" {
+		syncer, _ = StartS3Syncer(bucketName, logDir, zl)
+	}
+
+	return &Logger{zl: zl, syncer: syncer}, nil
 }
 
 // Sync flushes any buffered log entries. Must be called via defer in main().
 func (l *Logger) Sync() {
+	if l.syncer != nil {
+		l.syncer.Stop()
+	}
 	// Error intentionally ignored — common on stdout/stderr
 	_ = l.zl.Sync()
 }
